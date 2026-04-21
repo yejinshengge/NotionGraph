@@ -21,7 +21,7 @@ export default function NodeDetail({ node, graph, onOpen, onFocus, onClose }: Pr
     .filter((n): n is GraphNode => !!n);
 
   return (
-    <section className="border-t border-notion-border bg-white max-h-[40%] flex flex-col">
+    <section className="border-t border-notion-border bg-notion-panel max-h-[40%] flex flex-col">
       <div className="flex items-start justify-between p-3 gap-2">
         <div className="min-w-0 flex-1">
           <div className="text-[11px] uppercase tracking-wide text-notion-muted">
@@ -57,7 +57,7 @@ export default function NodeDetail({ node, graph, onOpen, onFocus, onClose }: Pr
         <button
           type="button"
           onClick={onFocus}
-          className="text-xs px-2 h-7 rounded border border-notion-border hover:bg-notion-panel"
+          className="text-xs px-2 h-7 rounded border border-notion-border hover:bg-notion-border"
         >
           以此为根
         </button>
@@ -76,7 +76,7 @@ export default function NodeDetail({ node, graph, onOpen, onFocus, onClose }: Pr
               <button
                 type="button"
                 onClick={() => window.open(n.url, '_blank')}
-                className="w-full text-left text-xs text-notion-text hover:bg-notion-panel rounded px-1.5 py-1 truncate"
+                className="w-full text-left text-xs text-notion-text hover:bg-notion-border rounded px-1.5 py-1 truncate"
                 title={n.title}
               >
                 <span className={n.type === 'database' ? 'text-red-500' : 'text-notion-accent'}>

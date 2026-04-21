@@ -10,14 +10,20 @@
 import { useEffect, useMemo, useRef, type ReactElement } from 'react';
 import cytoscape, { type Core, type ElementDefinition } from 'cytoscape';
 import fcose from 'cytoscape-fcose';
+import cola from 'cytoscape-cola';
 import type { GraphData, GraphNode } from '@/core/types';
 
 // 注册布局（多次注册会被 cytoscape 自行 dedupe，但为稳妥判重）
 let fcoseRegistered = false;
+let colaRegistered = false;
 function ensureLayout(): void {
   if (!fcoseRegistered) {
     cytoscape.use(fcose);
     fcoseRegistered = true;
+  }
+  if (!colaRegistered) {
+    cytoscape.use(cola);
+    colaRegistered = true;
   }
 }
 
@@ -32,6 +38,7 @@ interface Props {
 export default function GraphView(props: Props): ReactElement {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const cyRef = useRef<Core | null>(null);
+  const layoutRef = useRef<cytoscape.Layouts | null>(null);
 
   const elements = useMemo(() => toElements(props.graph), [props.graph]);
 
@@ -46,15 +53,17 @@ export default function GraphView(props: Props): ReactElement {
       elements,
       style: STYLE,
       wheelSensitivity: 0.25,
-      minZoom: 0.2,
-      maxZoom: 3,
+      minZoom: 0.1,
+      maxZoom: 4,
     });
     cyRef.current = cy;
 
     // 容器刚挂载时可能还没有非零尺寸（尤其是 Shadow DOM + flex 的组合），
-    // 若此时跑 fcose，viewport 近似 0，随机散列会坍缩到一条线。
+    // 若此时跑 fcose/cola，viewport 近似 0，随机散列会坍缩到一条线。
     // 这里等容器拥有实际尺寸、且布局帧稳定后再启动。
-    runLayoutWhenReady(cy, container, LAYOUT_OPTIONS);
+    runLayoutWhenReady(cy, container, LAYOUT_OPTIONS, (layout) => {
+      layoutRef.current = layout;
+    });
 
     // 事件绑定
     cy.on('tap', 'node', (evt) => {
@@ -78,7 +87,18 @@ export default function GraphView(props: Props): ReactElement {
       }
     });
 
+    // 拖拽节点时，cola 会自动处理，但为了更好的交互，可以在拖拽时增加一些样式
+    cy.on('grabon', 'node', (evt) => {
+      evt.target.addClass('grabbed');
+    });
+    cy.on('free', 'node', (evt) => {
+      evt.target.removeClass('grabbed');
+    });
+
     return () => {
+      if (layoutRef.current) {
+        layoutRef.current.stop();
+      }
       cy.destroy();
       cyRef.current = null;
     };
@@ -90,11 +110,18 @@ export default function GraphView(props: Props): ReactElement {
     const cy = cyRef.current;
     const container = containerRef.current;
     if (!cy || !container) return;
+    
+    if (layoutRef.current) {
+      layoutRef.current.stop();
+    }
+
     cy.batch(() => {
       cy.elements().remove();
       cy.add(elements);
     });
-    runLayoutWhenReady(cy, container, LAYOUT_OPTIONS);
+    runLayoutWhenReady(cy, container, LAYOUT_OPTIONS, (layout) => {
+      layoutRef.current = layout;
+    });
   }, [elements]);
 
   // 搜索过滤：不重算布局，仅改样式
@@ -193,28 +220,20 @@ function clearHighlight(cy: Core): void {
  *   - `tilingPaddingVertical/Horizontal`：给孤立/小团块留出空间，视觉上更接近 Obsidian 图谱。
  */
 const LAYOUT_OPTIONS = {
-  name: 'fcose',
-  quality: 'proof',
+  name: 'cola',
   animate: true,
-  animationDuration: 500,
-  animationEasing: 'ease-out',
-  randomize: true,
-  uniformNodeDimensions: false,
-  packComponents: true,
-  nodeRepulsion: () => 12000,
-  idealEdgeLength: () => 120,
-  edgeElasticity: () => 0.2,
-  gravity: 0.25,
-  gravityRangeCompound: 1.5,
-  gravityCompound: 1.0,
-  gravityRange: 3.8,
-  nodeSeparation: 80,
-  numIter: 2500,
-  tile: true,
-  tilingPaddingVertical: 20,
-  tilingPaddingHorizontal: 20,
+  refresh: 1,
+  infinite: true,
+  fit: false,
   padding: 30,
-  fit: true,
+  randomize: true,
+  nodeSpacing: () => 30,
+  edgeLength: () => 100,
+  edgeSymDiffLength: () => 50,
+  edgeJaccardLength: () => 50,
+  unconstrIter: 10,
+  userConstIter: 10,
+  allConstIter: 10,
 } as unknown as cytoscape.LayoutOptions;
 
 /**
@@ -225,10 +244,13 @@ function runLayoutWhenReady(
   cy: Core,
   container: HTMLElement,
   options: cytoscape.LayoutOptions,
+  onLayoutReady?: (layout: cytoscape.Layouts) => void
 ): void {
   const start = () => {
     cy.resize();
-    cy.layout(options).run();
+    const layout = cy.layout(options);
+    layout.run();
+    if (onLayoutReady) onLayoutReady(layout);
   };
 
   const rect = container.getBoundingClientRect();
@@ -255,70 +277,100 @@ function runLayoutWhenReady(
   }, 1000);
 }
 
-const STYLE: cytoscape.StylesheetJson = [
+const STYLE: any = [
   {
     selector: 'node',
     style: {
       label: 'data(title)',
       'text-wrap': 'ellipsis',
-      'text-max-width': '120px',
-      'font-size': 11,
-      color: '#37352f',
+      'text-max-width': '150px',
+      'font-size': 12,
+      color: '#d4d4d4',
       'text-valign': 'bottom',
-      'text-margin-y': 4,
+      'text-margin-y': 6,
       width: 'data(size)',
       height: 'data(size)',
-      'background-color': '#2383e2',
-      'border-width': 2,
-      'border-color': '#ffffff',
+      'background-color': '#a882ff',
+      'border-width': 1,
+      'border-color': '#444444',
       'overlay-opacity': 0,
+      'text-outline-color': '#1e1e1e',
+      'text-outline-width': 2,
     },
   },
   {
     selector: 'node.node-db',
-    style: { shape: 'round-diamond', 'background-color': '#e03e3e' },
+    style: { shape: 'round-diamond', 'background-color': '#ff6b6b' },
   },
   {
     selector: 'node.node-page',
-    style: { shape: 'ellipse', 'background-color': '#2383e2' },
+    style: { shape: 'ellipse', 'background-color': '#a882ff' },
   },
   {
     selector: 'node.node-root',
-    style: { 'border-width': 4, 'border-color': '#f4b400' },
+    style: { 'border-width': 3, 'border-color': '#ffd700', 'background-color': '#ffd700' },
   },
   {
     selector: 'node.node-unauthorized',
-    style: { 'background-color': '#c7c6c0', color: '#787774' },
+    style: { 'background-color': '#555555', color: '#888888' },
   },
   {
     selector: 'edge',
     style: {
-      width: 1.2,
+      width: 1.5,
       'curve-style': 'bezier',
-      'line-color': '#b8b8b4',
-      'target-arrow-color': '#b8b8b4',
-      'target-arrow-shape': 'triangle',
-      'arrow-scale': 0.9,
+      'line-color': '#555555',
+      'target-arrow-color': '#555555',
+      'target-arrow-shape': 'none',
+      'arrow-scale': 0.8,
+      opacity: 0.6,
     },
   },
   {
     selector: 'edge.edge-parent',
-    style: { 'line-color': '#787774', 'target-arrow-color': '#787774' },
+    style: { 'line-color': '#444444', 'target-arrow-color': '#444444' },
   },
   {
     selector: 'edge.edge-link',
-    style: { 'line-style': 'dashed', 'line-color': '#2383e2', 'target-arrow-color': '#2383e2' },
+    style: { 'line-style': 'solid', 'line-color': '#666666', 'target-arrow-color': '#666666' },
   },
   {
     selector: '.faded',
-    style: { opacity: 0.15 },
+    style: { opacity: 0.1 },
   },
   {
     selector: '.focused',
-    style: { opacity: 1 },
+    style: { 
+      opacity: 1,
+      'text-outline-width': 3,
+      'text-outline-color': '#000000',
+      'z-index': 9999,
+    },
+  },
+  {
+    selector: 'node.focused',
+    style: {
+      'border-width': 3,
+      'border-color': '#ffffff',
+    },
+  },
+  {
+    selector: 'edge.focused',
+    style: {
+      width: 2.5,
+      'line-color': '#aaaaaa',
+      opacity: 1,
+    }
   },
   {
     selector: 'node.dimmed',
-    style: { opacity: 0.25 },
+    style: { opacity: 0.15 },
   },
+  {
+    selector: 'node.grabbed',
+    style: {
+      'border-width': 4,
+      'border-color': '#ffffff',
+    }
+  }
 ];

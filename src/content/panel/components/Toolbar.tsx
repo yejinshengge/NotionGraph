@@ -16,7 +16,7 @@ interface Props {
 
 export default function Toolbar(props: Props): ReactElement {
   return (
-    <div className="flex flex-col gap-2 px-3 py-2 border-b border-notion-border bg-white/60">
+    <div className="flex flex-col gap-2 px-3 py-2 border-b border-notion-border bg-notion-panel/80 backdrop-blur-sm">
       <div className="flex items-center gap-2">
         <label className="text-[11px] text-notion-muted whitespace-nowrap">深度</label>
         <input
@@ -48,7 +48,7 @@ export default function Toolbar(props: Props): ReactElement {
         value={props.query}
         onChange={(e) => props.onQueryChange(e.target.value)}
         placeholder="搜索节点标题..."
-        className="w-full h-8 px-2 text-xs rounded border border-notion-border bg-white
+        className="w-full h-8 px-2 text-xs rounded border border-notion-border bg-notion-bg text-notion-text
                    focus:outline-none focus:ring-2 focus:ring-notion-accent/40"
       />
     </div>

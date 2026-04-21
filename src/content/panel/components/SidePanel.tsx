@@ -56,7 +56,7 @@ export default function SidePanel(props: Props): ReactElement {
       style={{ width: 'clamp(360px, 30vw, 560px)', pointerEvents: 'auto' }}
     >
       {/* 标题栏 */}
-      <header className="flex items-center justify-between px-3 h-11 border-b border-notion-border bg-white">
+      <header className="flex items-center justify-between px-3 h-11 border-b border-notion-border bg-notion-panel">
         <div className="flex items-center gap-2 min-w-0">
           <div className="w-6 h-6 rounded bg-notion-accent text-white flex items-center justify-center text-xs">
             NG

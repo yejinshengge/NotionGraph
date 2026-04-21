@@ -8,12 +8,12 @@ export default {
     extend: {
       colors: {
         notion: {
-          bg: '#ffffff',
-          panel: '#fbfbfa',
-          border: '#e9e9e7',
-          text: '#37352f',
-          muted: '#787774',
-          accent: '#2383e2',
+          bg: '#1e1e1e',
+          panel: '#252526',
+          border: '#3c3c3c',
+          text: '#d4d4d4',
+          muted: '#888888',
+          accent: '#a882ff',
         },
       },
       fontFamily: {
