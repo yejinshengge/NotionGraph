@@ -4,11 +4,16 @@
  * 性能策略（针对 200+ 节点的大图）：
  *   - 初始布局一次性收敛即停（cola `infinite:false` + `maxSimulationTime`），
  *       静止时 CPU 占用归零；
- *   - 拖拽节点时启动 infinite cola（保留坐标、不 fit），邻居按弹簧力联动；
- *       松手后切换为 finite cola（有 maxSimulationTime）让力场自然衰减到平衡再停，
- *       不是硬 stop —— Obsidian 风格的弹性手感 + 低稳态功耗 + 平滑缓动；
- *   - 平移/缩放时隐藏 label 并用纹理缓存，但**不**隐藏边，以免和拖拽时 cola 持续
- *       更新节点位置冲突导致连线"闪没"；
+ *   - 拖拽交互**只影响被拖节点的 parent-child 下游子树**，其他未被拖的节点
+ *     不会因为松手而被全图 settle cola 重新推一遍 —— 以此对齐 Obsidian 行为：
+ *     拖到哪儿就停在哪儿；并同时避免"度数大的节点被大量邻居弹簧钉住、度数小的
+ *     被大节点反向拽回去"这种看上去很诡异的权重不对称感；
+ *   - 子节点跟随使用**非线性"橡皮筋"力**（而非简单弹簧）：
+ *         F = (k_base + k_stretch · |d|² / ref²) · d
+ *       小位移时几乎松弛、带柔和滞后；位移越大张力越强、把节点迅速"绷"过去；
+ *       阻尼近临界 → 不会像弹簧那样反复回荡，触感更像弹力绳；
+ *   - 平移/缩放时隐藏 label 并用纹理缓存，但**不**隐藏边，以免和拖拽动画
+ *     持续更新节点位置冲突导致连线"闪没"；
  *   - 边统一使用 `straight`（不用 haystack）：haystack 虽快，但 focused 时若切换到
  *       straight 会导致端点渲染位置跳变，视觉上像是节点突然移动了；
  *   - 节点 label 通过 `min-zoomed-font-size` 在 zoom-out 时自动隐藏，减少文本绘制；
@@ -53,6 +58,19 @@ export default function GraphView(props: Props): ReactElement {
   // 当前是否处于"真实拖拽"中。仅当 cytoscape 触发过 `drag`（节点位置确实变化）后才置位；
   // 用来把"单击选中"与"拖动"彻底分开，避免单纯 mousedown/mouseup 也会扰动整个力场。
   const draggingIdRef = useRef<string | null>(null);
+  // 当前被拖节点的 parent-child 下游子树快照：记录每个后代相对父节点的**静止态位移**。
+  // `grabon` 时抓取一次，后续弹簧动画把每个后代朝着 父节点新位置 + 初始位移 的目标点
+  // 按 `F = k·(target − pos)` 拉近，实现"带滞后、带轻微回荡"的灵动跟随，
+  // 取代此前"硬刚性吸附"的做法。
+  const dragSubtreeRef = useRef<{
+    parentId: string;
+    offsets: Array<{ node: cytoscape.NodeSingular; dx: number; dy: number }>;
+  } | null>(null);
+  // 用户当前是否按住节点。`dragfreeon` 置 false —— 弹簧动画循环据此判断
+  // 何时可以"阻尼到接近静止后自行停止"。
+  const isGrabbingRef = useRef<boolean>(false);
+  // 当前弹簧动画循环的停止句柄。重新 grab 或 free 时需要强制终止。
+  const dragSpringRef = useRef<{ stop: () => void } | null>(null);
 
   const elements = useMemo(() => toElements(props.graph), [props.graph]);
   // 搜索关键字在大图上 O(N) 过滤，降级为低优先级更新，避免输入卡顿
@@ -116,44 +134,73 @@ export default function GraphView(props: Props): ReactElement {
       }
     });
 
-    // 拖拽节点：弹性联动（Obsidian 风格）。
+    // 拖拽节点：子树橡皮筋跟随 —— 松手后其他节点绝不挪动。
     //
-    // 设计：
-    //   - `grabon`：**只做视觉高亮**（加 grabbed class、亮起相连边），不启动任何布局。
-    //       —— 单击选中时 mousedown 也会触发 grab，若此时就启动 cola，整张图会被
-    //       重新施力抖一下。
-    //   - `drag`（节点位置确实发生变化时才触发）首次触发 → 认定为"真实拖拽"，
-    //       此时才启动 infinite cola，让邻居在弹簧/斥力下自然跟随。
-    //   - `dragfreeon`（**拖动过**才松手才触发；纯单击不会触发）→ 切换到
-    //       **finite cola**（有 maxSimulationTime），让力场自然衰减到接近平衡再停。
-    //   - `free`：所有松手都会触发；若并非真实拖拽，则仅清理视觉高亮，不动布局。
-    //   - 若用户接连拖拽多个节点，再次启动 drag 布局会 cancel 掉正在运行的 settle。
+    // 设计要点：
+    //   - `grabon`：
+    //       · 停掉上一轮可能还在衰减的橡皮筋循环，避免并发写同一批后代；
+    //       · 预计算 parent-child 下游子树，记录每个后代相对父节点的**静止态位移**
+    //         —— 后续动画把"父节点位置 + 该位移"当作目标点；
+    //       · 不启动任何力模拟 —— 单击也会走到这里，此时启动会浪费 CPU。
+    //   - `drag`（节点位置确实发生变化时才触发）：
+    //       · 首帧才启动橡皮筋循环 —— 把单纯的单击 mousedown/mouseup 与真实拖拽分开；
+    //       · 循环接管所有后代位置更新，本事件回调里不再手动改位置。
+    //   - `dragfreeon`（**拖动过**才松手才触发）：
+    //       · 仅把 `isGrabbingRef` 置 false —— 让循环自然阻尼到静止后自行退出；
+    //       · **不**启动任何全图 settle —— 对齐 Obsidian 行为：拖到哪儿就停在哪儿，
+    //         未被拖的节点保持原位不动；同时也避免"小度节点拖大度节点被拽回去"
+    //         这种权重不对称的诡异感。
+    //   - `free`：纯单击未拖动时只清理视觉高亮，不触发任何动画。
     cy.on('grabon', 'node', (evt) => {
       const node = evt.target;
+
+      // 强制终止上一轮可能还在阻尼衰减的橡皮筋循环，避免两个循环同时写同一批后代
+      if (dragSpringRef.current) {
+        dragSpringRef.current.stop();
+        dragSpringRef.current = null;
+      }
+      // 兜底：极端情况下（组件重建、异常中断）可能遗留 lock 状态 —— 统一放行
+      cy.nodes().unlock();
+
       node.addClass('grabbed');
       highlightConnectedEdges(cy, node.id());
       draggingIdRef.current = null; // 等 `drag` 事件确认是否为真实拖拽
+      isGrabbingRef.current = true;
+
+      // 预计算子树后代相对父节点的静止态位移，循环把它当作目标基准
+      const px = node.position('x');
+      const py = node.position('y');
+      const descendants = collectSubtreeDescendants(node);
+      dragSubtreeRef.current = {
+        parentId: node.id(),
+        offsets: descendants.map((d) => ({
+          node: d,
+          dx: d.position('x') - px,
+          dy: d.position('y') - py,
+        })),
+      };
     });
     cy.on('drag', 'node', (evt) => {
       const node = evt.target;
-      if (draggingIdRef.current === node.id()) return; // 本次拖拽已经启动过布局
+      if (draggingIdRef.current === node.id()) return; // 已经启动过循环
       draggingIdRef.current = node.id();
-      // 安全兜底：上一次 settle 可能还没来得及 unlock（例如 graph 重建、组件卸载等
-      // 异常路径），这里在新一次真实拖拽开始前统一放行其余节点，避免出现"某个节点再也拖不动"。
-      cy.nodes().not(node).unlock();
-      startDragLayout(cy, layoutRef);
+
+      // 首次真实拖拽 → 启动子树橡皮筋跟随。无子树的叶子节点直接省掉这次 rAF。
+      const sub = dragSubtreeRef.current;
+      if (sub && sub.parentId === node.id() && sub.offsets.length > 0) {
+        dragSpringRef.current = startSubtreeSpring(cy, sub, isGrabbingRef, () => {
+          dragSpringRef.current = null;
+        });
+      }
     });
     cy.on('dragfreeon', 'node', (evt) => {
       const node = evt.target;
       node.removeClass('grabbed');
       clearConnectedEdges(cy);
       draggingIdRef.current = null;
-      // 关键：锁定松手节点，避免 settle 布局把它拉回原力场平衡位置（否则"弹回原地"）；
-      // settle 结束（layoutstop）时 unlock，恢复用户拖拽能力。
-      node.lock();
-      startSettleLayout(cy, layoutRef, () => {
-        node.unlock();
-      });
+      // 注意：**不**立即清理 dragSubtreeRef，也**不**强制 stop 橡皮筋循环
+      // —— 保留一段自然阻尼尾随，子节点会柔和收紧后静止，就像真正的弹力绳。
+      isGrabbingRef.current = false;
     });
     cy.on('free', 'node', (evt) => {
       // 仅处理"单击未拖动"的 free：清理视觉状态即可，不触碰布局，避免整图抖动。
@@ -161,11 +208,22 @@ export default function GraphView(props: Props): ReactElement {
       const node = evt.target;
       node.removeClass('grabbed');
       clearConnectedEdges(cy);
+      isGrabbingRef.current = false;
+      dragSubtreeRef.current = null;
+      // 单击路径上循环并未启动，但为保险还是 stop 一次
+      if (dragSpringRef.current) {
+        dragSpringRef.current.stop();
+        dragSpringRef.current = null;
+      }
     });
 
     return () => {
       if (layoutRef.current) {
         layoutRef.current.stop();
+      }
+      if (dragSpringRef.current) {
+        dragSpringRef.current.stop();
+        dragSpringRef.current = null;
       }
       cy.destroy();
       cyRef.current = null;
@@ -304,81 +362,145 @@ function clearConnectedEdges(cy: Core): void {
 }
 
 /**
- * 拖拽期间使用的 cola 布局：
- *   - `randomize: false`：保留现有节点坐标，仅施加力；否则会把整张图重随机散布。
- *   - `infinite: true`：持续模拟，直到 free 后切换成 settle 布局。
- *   - `fit: false`：不重置 viewport（用户当前的缩放/平移保持不变）。
- *   - `unconstrIter / userConstIter / allConstIter = 0`：**关键**。cola 默认会在
- *       `run()` 的第一帧里一次性跑完这三组初始约束迭代，把所有节点往力学平衡位置
- *       推一次——表现为"开始拖拽的瞬间整图抖一下"。对于"保留当前坐标基础上做实时
- *       联动"的拖拽场景，这次冷启动松弛是多余的；设为 0 即可让 cola 从当前坐标
- *       开始、按 tick 平滑施力，拖拽起手丝滑无跳变。
+ * 子树"橡皮筋"跟随动画参数。
  *
- * cytoscape 把被 `grab` 的节点视为"固定点"（grabbed 属性为 true），cola 在每一步
- * 计算时不会改变它的位置，周围节点通过弹簧/斥力被自然带动——这就是 Obsidian 风格的
- * 弹性拖拽手感。
+ * 物理模型：半隐式 Euler 积分 + 非线性刚度（刚度随拉伸距离平方增长）：
+ *     k_eff = BASE_STIFFNESS + STRETCH_STIFFNESS · |d|² / STRETCH_REF_SQ
+ *     v' = v · (1 − DAMPING) + k_eff · d           （d = target − pos）
+ *     pos' = pos + v'
+ *
+ * 设计直觉：
+ *   - 小位移（父节点缓慢移动或已接近目标）→ k_eff ≈ BASE，柔和松弛，带明显滞后；
+ *   - 大位移（鼠标快速拖拽）→ 二次项主导，张力迅速增加，把子节点"绷紧"拉过去；
+ *   - 这一非线性行为正是弹力绳和线性弹簧的本质区别。
+ *
+ * 阻尼参数接近临界（以 BASE 计 ζ ≈ 0.87），基本无过冲 → 不会像弹簧那样来回晃，
+ * 手感更柔、更像弹力绳松开后"拉紧归位"的收尾。
+ *
+ * 速度每帧按 `(1 − DAMPING)` 衰减，因此即使在张力很大时也不会失稳发散。
  */
-function startDragLayout(cy: Core, layoutRef: { current: cytoscape.Layouts | null }): void {
-  if (layoutRef.current) {
-    layoutRef.current.stop();
-  }
-  const dragOptions = {
-    ...(LAYOUT_OPTIONS as unknown as Record<string, unknown>),
-    randomize: false,
-    infinite: true,
-    fit: false,
-    animate: true,
-    maxSimulationTime: Number.POSITIVE_INFINITY,
-    // 禁用冷启动松弛，避免起手瞬间整图位移
-    unconstrIter: 0,
-    userConstIter: 0,
-    allConstIter: 0,
-  } as unknown as cytoscape.LayoutOptions;
-  const layout = cy.layout(dragOptions);
-  layout.run();
-  layoutRef.current = layout;
+const RUBBER_BASE_STIFFNESS = 0.10;
+const RUBBER_STRETCH_STIFFNESS = 0.35;
+const RUBBER_STRETCH_REF_SQ = 120 * 120; // 位移平方参考值：|d| ≈ 120px 时二次项与 BASE 同阶
+const RUBBER_DAMPING = 0.55;
+const RUBBER_REST_SPEED_SQ = 0.04; // (0.2 px/frame)²
+
+/**
+ * 启动子树的橡皮筋跟随动画循环。
+ *
+ * 每一帧：
+ *   1) 读取父节点当前位置（由用户鼠标或松手后的最终位置决定）；
+ *   2) 对每个后代计算目标点 target = parentPos + restOffset；
+ *   3) 按"非线性刚度 + 半隐式 Euler"推进速度与位置；
+ *   4) `cy.batch` 合批写入，减少 cytoscape 的 dirty 传播开销。
+ *
+ * 退出条件：
+ *   - 外部调用返回的 stop()（grab 新节点、组件卸载等）；
+ *   - 父节点已被移除；
+ *   - 用户已松手 (`isGrabbingRef.current === false`) 且所有后代速度平方都低于
+ *     `RUBBER_REST_SPEED_SQ` —— 即阻尼衰减到视觉上已静止。
+ *
+ * 注意：
+ *   - 对 `locked()` / `removed()` 的后代静默跳过，避免和 graph 变更或外部 lock 冲突；
+ *   - 每个后代的 velocity 独立存在 Map 里，初次见到时初始化为 0；
+ *   - **不依赖任何 cola 布局**，所以未被拖的节点完全不会因拖拽而移动。
+ */
+function startSubtreeSpring(
+  cy: Core,
+  subtree: {
+    parentId: string;
+    offsets: Array<{ node: cytoscape.NodeSingular; dx: number; dy: number }>;
+  },
+  isGrabbingRef: { readonly current: boolean },
+  onDone: () => void,
+): { stop: () => void } {
+  const velocities = new Map<string, { vx: number; vy: number }>();
+  let stopped = false;
+  let rafId = 0;
+
+  const tick = (): void => {
+    if (stopped) return;
+    const parent = cy.getElementById(subtree.parentId);
+    if (parent.empty() || parent.removed()) {
+      stopped = true;
+      onDone();
+      return;
+    }
+    const px = parent.position('x');
+    const py = parent.position('y');
+    let maxSpeedSq = 0;
+
+    cy.batch(() => {
+      for (const item of subtree.offsets) {
+        if (item.node.removed() || item.node.locked()) continue;
+        const pos = item.node.position();
+        const dx = px + item.dx - pos.x;
+        const dy = py + item.dy - pos.y;
+        // 非线性刚度：k_eff = BASE + STRETCH · |d|² / REF²
+        // 位移越大，二次项占比越高，张力"绷紧"；位移小则保持松弛感。
+        const distSq = dx * dx + dy * dy;
+        const kEff =
+          RUBBER_BASE_STIFFNESS + RUBBER_STRETCH_STIFFNESS * (distSq / RUBBER_STRETCH_REF_SQ);
+        let v = velocities.get(item.node.id());
+        if (!v) {
+          v = { vx: 0, vy: 0 };
+          velocities.set(item.node.id(), v);
+        }
+        v.vx = v.vx * (1 - RUBBER_DAMPING) + dx * kEff;
+        v.vy = v.vy * (1 - RUBBER_DAMPING) + dy * kEff;
+        item.node.position({ x: pos.x + v.vx, y: pos.y + v.vy });
+        const s = v.vx * v.vx + v.vy * v.vy;
+        if (s > maxSpeedSq) maxSpeedSq = s;
+      }
+    });
+
+    // 用户已松手 + 阻尼到接近静止 → 自然结束循环
+    if (!isGrabbingRef.current && maxSpeedSq < RUBBER_REST_SPEED_SQ) {
+      stopped = true;
+      onDone();
+      return;
+    }
+
+    rafId = requestAnimationFrame(tick);
+  };
+
+  rafId = requestAnimationFrame(tick);
+
+  return {
+    stop: (): void => {
+      if (stopped) return;
+      stopped = true;
+      cancelAnimationFrame(rafId);
+    },
+  };
 }
 
 /**
- * 松手后的 "settle"（缓动收敛）布局：
- *   - 从 infinite 切回 finite，`maxSimulationTime: 1800` 让 cola 在一个略长的时间窗口内
- *       自然衰减到力学平衡；由于弹簧已经接近稳定，最后几帧的位移本来就很小，
- *       看起来是平滑渐停而不是"突然定住"。
- *   - 保留 `animate/refresh` 和默认的 `convergenceThreshold`，让 cola 若早已稳定可提前结束。
- *   - 不 randomize、不 fit，保持用户视角不变。
+ * 沿 parent-child 有向边向下 BFS，收集给定节点的所有后代。
  *
- * @param onStop  当 settle 布局停止（自然到期或被后续 grab 打断）时回调一次。
- *                通常用于 unlock 之前被 free 锁定的节点。
+ * 说明：
+ *   - 只跟随 `edge.edge-parent` 这一类有向边（source=父，target=子），
+ *     不会顺着 link-to-page 扩散，避免把"被引用页"误当作子页搬走。
+ *   - 结果不包含节点自身；如果节点是叶子或无子树，返回空数组。
+ *   - Set 去重防止父子环或 DAG 场景下重复搬运同一节点。
  */
-function startSettleLayout(
-  cy: Core,
-  layoutRef: { current: cytoscape.Layouts | null },
-  onStop?: () => void
-): void {
-  if (layoutRef.current) {
-    layoutRef.current.stop();
+function collectSubtreeDescendants(node: cytoscape.NodeSingular): cytoscape.NodeSingular[] {
+  const visited = new Set<string>([node.id()]);
+  const result: cytoscape.NodeSingular[] = [];
+  const queue: cytoscape.NodeSingular[] = [node];
+  while (queue.length > 0) {
+    const cur = queue.shift()!;
+    const childEdges = cur.outgoers('edge.edge-parent');
+    childEdges.forEach((edge) => {
+      const child = edge.target();
+      const cid = child.id();
+      if (visited.has(cid)) return;
+      visited.add(cid);
+      result.push(child);
+      queue.push(child);
+    });
   }
-  const settleOptions = {
-    ...(LAYOUT_OPTIONS as unknown as Record<string, unknown>),
-    randomize: false,
-    infinite: false,
-    fit: false,
-    animate: true,
-    // 缓动时长：足够长以掩盖 stop 边界，但也不会让 CPU 空转太久
-    maxSimulationTime: 1800,
-    // 同样关闭冷启动松弛：settle 起步坐标已经接近平衡，避免切换瞬间出现位移跳变
-    unconstrIter: 0,
-    userConstIter: 0,
-    allConstIter: 0,
-  } as unknown as cytoscape.LayoutOptions;
-  const layout = cy.layout(settleOptions);
-  if (onStop) {
-    // `one` 保证无论是自然到期、convergenceThreshold 提前结束，还是被后续 grab
-    // 主动 stop，都只会回调一次，避免重复 unlock。
-    layout.one('layoutstop', onStop);
-  }
-  layout.run();
-  layoutRef.current = layout;
+  return result;
 }
 
 /**
