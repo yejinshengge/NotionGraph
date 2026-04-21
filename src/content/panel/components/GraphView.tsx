@@ -50,6 +50,9 @@ export default function GraphView(props: Props): ReactElement {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const cyRef = useRef<Core | null>(null);
   const layoutRef = useRef<cytoscape.Layouts | null>(null);
+  // 当前是否处于"真实拖拽"中。仅当 cytoscape 触发过 `drag`（节点位置确实变化）后才置位；
+  // 用来把"单击选中"与"拖动"彻底分开，避免单纯 mousedown/mouseup 也会扰动整个力场。
+  const draggingIdRef = useRef<string | null>(null);
 
   const elements = useMemo(() => toElements(props.graph), [props.graph]);
   // 搜索关键字在大图上 O(N) 过滤，降级为低优先级更新，避免输入卡顿
@@ -114,33 +117,50 @@ export default function GraphView(props: Props): ReactElement {
     });
 
     // 拖拽节点：弹性联动（Obsidian 风格）。
+    //
     // 设计：
-    //   - grab 时启动 infinite cola：被拖拽节点被 cytoscape 自动视作固定点，
-    //       邻居在弹簧/斥力下自然跟随。同时给相连边加 `drag-connected` 高亮，
-    //       让用户一眼看到当前节点连接了哪些其他节点。
-    //   - free 时不硬 stop，而是切换到 **finite cola**（有 maxSimulationTime），
-    //       让力场自然衰减到接近平衡再停 —— 这样整张图的"缓动"曲线是衰减的，
-    //       不会在最后一刻出现突兀的静止帧。
-    //   - 若用户接连拖拽多个节点，再次 grab 会 cancel 掉正在运行的 settle 布局。
+    //   - `grabon`：**只做视觉高亮**（加 grabbed class、亮起相连边），不启动任何布局。
+    //       —— 单击选中时 mousedown 也会触发 grab，若此时就启动 cola，整张图会被
+    //       重新施力抖一下。
+    //   - `drag`（节点位置确实发生变化时才触发）首次触发 → 认定为"真实拖拽"，
+    //       此时才启动 infinite cola，让邻居在弹簧/斥力下自然跟随。
+    //   - `dragfreeon`（**拖动过**才松手才触发；纯单击不会触发）→ 切换到
+    //       **finite cola**（有 maxSimulationTime），让力场自然衰减到接近平衡再停。
+    //   - `free`：所有松手都会触发；若并非真实拖拽，则仅清理视觉高亮，不动布局。
+    //   - 若用户接连拖拽多个节点，再次启动 drag 布局会 cancel 掉正在运行的 settle。
     cy.on('grabon', 'node', (evt) => {
       const node = evt.target;
-      // 安全兜底：上一次 settle 可能还没来得及 unlock（例如 graph 重建、组件卸载等
-      // 异常路径），这里在新一次拖拽开始前统一放行所有节点，避免出现"某个节点再也拖不动"。
-      cy.nodes().unlock();
       node.addClass('grabbed');
       highlightConnectedEdges(cy, node.id());
+      draggingIdRef.current = null; // 等 `drag` 事件确认是否为真实拖拽
+    });
+    cy.on('drag', 'node', (evt) => {
+      const node = evt.target;
+      if (draggingIdRef.current === node.id()) return; // 本次拖拽已经启动过布局
+      draggingIdRef.current = node.id();
+      // 安全兜底：上一次 settle 可能还没来得及 unlock（例如 graph 重建、组件卸载等
+      // 异常路径），这里在新一次真实拖拽开始前统一放行其余节点，避免出现"某个节点再也拖不动"。
+      cy.nodes().not(node).unlock();
       startDragLayout(cy, layoutRef);
     });
-    cy.on('free', 'node', (evt) => {
+    cy.on('dragfreeon', 'node', (evt) => {
       const node = evt.target;
       node.removeClass('grabbed');
       clearConnectedEdges(cy);
+      draggingIdRef.current = null;
       // 关键：锁定松手节点，避免 settle 布局把它拉回原力场平衡位置（否则"弹回原地"）；
       // settle 结束（layoutstop）时 unlock，恢复用户拖拽能力。
       node.lock();
       startSettleLayout(cy, layoutRef, () => {
         node.unlock();
       });
+    });
+    cy.on('free', 'node', (evt) => {
+      // 仅处理"单击未拖动"的 free：清理视觉状态即可，不触碰布局，避免整图抖动。
+      if (draggingIdRef.current !== null) return; // 真实拖拽，交给 dragfreeon 处理
+      const node = evt.target;
+      node.removeClass('grabbed');
+      clearConnectedEdges(cy);
     });
 
     return () => {
@@ -288,6 +308,11 @@ function clearConnectedEdges(cy: Core): void {
  *   - `randomize: false`：保留现有节点坐标，仅施加力；否则会把整张图重随机散布。
  *   - `infinite: true`：持续模拟，直到 free 后切换成 settle 布局。
  *   - `fit: false`：不重置 viewport（用户当前的缩放/平移保持不变）。
+ *   - `unconstrIter / userConstIter / allConstIter = 0`：**关键**。cola 默认会在
+ *       `run()` 的第一帧里一次性跑完这三组初始约束迭代，把所有节点往力学平衡位置
+ *       推一次——表现为"开始拖拽的瞬间整图抖一下"。对于"保留当前坐标基础上做实时
+ *       联动"的拖拽场景，这次冷启动松弛是多余的；设为 0 即可让 cola 从当前坐标
+ *       开始、按 tick 平滑施力，拖拽起手丝滑无跳变。
  *
  * cytoscape 把被 `grab` 的节点视为"固定点"（grabbed 属性为 true），cola 在每一步
  * 计算时不会改变它的位置，周围节点通过弹簧/斥力被自然带动——这就是 Obsidian 风格的
@@ -304,6 +329,10 @@ function startDragLayout(cy: Core, layoutRef: { current: cytoscape.Layouts | nul
     fit: false,
     animate: true,
     maxSimulationTime: Number.POSITIVE_INFINITY,
+    // 禁用冷启动松弛，避免起手瞬间整图位移
+    unconstrIter: 0,
+    userConstIter: 0,
+    allConstIter: 0,
   } as unknown as cytoscape.LayoutOptions;
   const layout = cy.layout(dragOptions);
   layout.run();
@@ -337,6 +366,10 @@ function startSettleLayout(
     animate: true,
     // 缓动时长：足够长以掩盖 stop 边界，但也不会让 CPU 空转太久
     maxSimulationTime: 1800,
+    // 同样关闭冷启动松弛：settle 起步坐标已经接近平衡，避免切换瞬间出现位移跳变
+    unconstrIter: 0,
+    userConstIter: 0,
+    allConstIter: 0,
   } as unknown as cytoscape.LayoutOptions;
   const layout = cy.layout(settleOptions);
   if (onStop) {
