@@ -16,7 +16,21 @@ import { toUuid } from './idUtils';
 const API_BASE = 'https://api.notion.com/v1';
 const NOTION_VERSION = '2022-06-28';
 
+/**
+ * 全局并发上限。贴近 Notion 官方 3 req/s 的软限制；
+ * 真正决定吞吐的是 `buildGraph` 中的 worker 池能否把这 3 个并发位长期占满。
+ */
 const limit = pLimit(3);
+
+/**
+ * 飞行中的 GET 请求去重表：同一 URL 在返回前再次被请求，直接复用同一个 Promise。
+ *
+ * 典型场景：
+ *   - 新 BFS worker 抓某 page 的 meta 时，另一 worker 因 link-to-page 同时触达该 page；
+ *   - 增量刷新并发 hydrate 大量 page 时。
+ * 去重只对 GET 生效；POST（如 database query）不安全，略过。
+ */
+const inFlight = new Map<string, Promise<Record<string, unknown>>>();
 
 /** 简化的 block/page/database 返回结构，只保留我们要用的字段 */
 export interface NotionPage {
@@ -27,6 +41,8 @@ export interface NotionPage {
   properties: Record<string, unknown>;
   in_trash?: boolean;
   archived?: boolean;
+  /** ISO 时间字符串；用于增量刷新脏检测 */
+  last_edited_time?: string;
 }
 
 export interface NotionDatabase {
@@ -37,6 +53,8 @@ export interface NotionDatabase {
   parent: { type: string; page_id?: string; workspace?: boolean };
   in_trash?: boolean;
   archived?: boolean;
+  /** ISO 时间字符串；用于增量刷新脏检测 */
+  last_edited_time?: string;
 }
 
 /** Notion block 我们按 type 做 narrow，用 unknown 承载未识别字段 */
@@ -156,9 +174,25 @@ export class NotionClient {
     }
   }
 
-  /** 所有 fetch 统一经过这里：限流 + 重试 + 鉴权 */
+  /** 所有 fetch 统一经过这里：限流 + 重试 + 鉴权 + 飞行中 GET 去重 */
   private async rawFetch(pathWithQuery: string, init: RequestInit = {}): Promise<Record<string, unknown>> {
-    return limit(() => this.doFetchWithRetry(pathWithQuery, init));
+    const method = (init.method ?? 'GET').toUpperCase();
+    if (method !== 'GET') {
+      return limit(() => this.doFetchWithRetry(pathWithQuery, init));
+    }
+
+    // GET：同一 URL 复用飞行中的 Promise，避免短时间重复发起
+    const key = `GET ${pathWithQuery}`;
+    const existing = inFlight.get(key);
+    if (existing) return existing;
+
+    const promise = limit(() => this.doFetchWithRetry(pathWithQuery, init));
+    inFlight.set(key, promise);
+    // 无论成功失败都要清掉 in-flight 记录，否则后续请求拿到旧的失败 Promise
+    promise.finally(() => {
+      if (inFlight.get(key) === promise) inFlight.delete(key);
+    });
+    return promise;
   }
 
   private async doFetchWithRetry(
@@ -238,4 +272,10 @@ export function extractPageTitle(page: NotionPage): string {
 /** 从 database 中提取标题 */
 export function extractDatabaseTitle(db: NotionDatabase): string {
   return (db.title ?? []).map((t) => t.plain_text).join('').trim();
+}
+
+/** 从 page/database 对象中安全取 last_edited_time */
+export function extractLastEditedTime(obj: NotionPage | NotionDatabase | null | undefined): string | undefined {
+  if (!obj) return undefined;
+  return typeof obj.last_edited_time === 'string' ? obj.last_edited_time : undefined;
 }

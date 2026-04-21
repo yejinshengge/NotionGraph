@@ -5,7 +5,8 @@
  */
 
 import { NotionClient, extractDatabaseTitle, extractPageTitle } from '@/core/notionClient';
-import { buildGraph } from '@/core/graphBuilder';
+import { buildGraph, revalidateGraph } from '@/core/graphBuilder';
+import { loadSnapshot, saveSnapshot, clearAllSnapshots } from '@/core/graphSnapshot';
 import { toCompactId } from '@/core/idUtils';
 import { loadSettings, saveSettings } from '@/shared/storage';
 import { cacheClearAll } from '@/shared/cache';
@@ -75,7 +76,8 @@ async function dispatchRequest(req: Request): Promise<Response> {
 
     case 'cache/clear':
       return handleRequest(async () => {
-        await cacheClearAll();
+        // API 级缓存和图谱快照都要清：否则 UI 点"清缓存"后仍会秒开旧快照
+        await Promise.all([cacheClearAll(), clearAllSnapshots()]);
         return { cleared: true };
       });
 
@@ -124,13 +126,45 @@ chrome.runtime.onConnect.addListener((port) => {
             signal,
           });
 
+          const snapKey = {
+            rootId: msg.options.rootId,
+            maxDepth: msg.options.maxDepth,
+            includeParentChild: msg.options.includeParentChild,
+            includeLinkToPage: msg.options.includeLinkToPage,
+          };
+
+          // bypassCache（即用户手动"刷新"）时强制全量重建，忽略快照
+          const snapshot = msg.options.bypassCache ? null : await loadSnapshot(snapKey);
+
+          if (snapshot) {
+            // 快照命中：立即推给前端，后台增量刷新
+            post({ type: 'snapshot', graph: snapshot.graph });
+            post({ type: 'revalidating' });
+
+            try {
+              const refreshed = await revalidateGraph(snapshot.graph, msg.options, {
+                client,
+                signal,
+              });
+              await saveSnapshot(snapKey, refreshed);
+              post({ type: 'done', graph: refreshed, incremental: true });
+            } catch (e) {
+              const message = e instanceof Error ? e.message : String(e);
+              if (message === 'aborted' || (e as Error)?.name === 'AbortError') return;
+              // 增量刷新失败不影响已渲染的快照：前端仍能正常使用缓存图谱
+              post({ type: 'error', message: `增量刷新失败：${message}` });
+            }
+            return;
+          }
+
+          // 无快照：走全量 BFS，上报进度
           const graph = await buildGraph(msg.options, {
             client,
             signal,
             onProgress: (progress) => post({ type: 'progress', progress }),
           });
-
-          post({ type: 'done', graph });
+          await saveSnapshot(snapKey, graph);
+          post({ type: 'done', graph, incremental: false });
         } catch (e) {
           const message = e instanceof Error ? e.message : String(e);
           if (message === 'aborted' || (e as Error)?.name === 'AbortError') return;

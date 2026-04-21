@@ -55,8 +55,14 @@ export type BuildClientMessage =
 
 /** background -> content/panel */
 export type BuildServerMessage =
+  /** 全量构建进度（仅无快照的首次构建才会发） */
   | { type: 'progress'; progress: BuildProgress }
-  | { type: 'done'; graph: GraphData }
+  /** 命中历史快照：前端可立即渲染，随后会收到 `revalidating` 然后 `done` */
+  | { type: 'snapshot'; graph: GraphData }
+  /** 快照命中后开始后台增量刷新的提示信号；前端展示"同步中"角标 */
+  | { type: 'revalidating' }
+  /** 构建/刷新完成，`graph` 为最终结果；`incremental` 标识是否来自增量刷新 */
+  | { type: 'done'; graph: GraphData; incremental: boolean }
   | { type: 'error'; message: string };
 
 // -------------------------- 辅助 --------------------------

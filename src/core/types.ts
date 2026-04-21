@@ -24,6 +24,12 @@ export interface GraphNode {
   depth: number;
   /** 反向链接 —— 指向本节点的其他节点 id 列表（去重） */
   backlinks: string[];
+  /**
+   * Notion 对象的最后编辑时间（ISO 字符串）。
+   * 用于增量刷新时的脏检测：若该值未变，则不必重抓 blocks。
+   * 对未授权或尚未 hydrate 的节点为 undefined。
+   */
+  lastEditedTime?: string;
 }
 
 /** 边的类型：父子嵌套 or 正文中的超链接/提及 */

@@ -19,7 +19,7 @@ type LoadState =
   | { status: 'no-root' }
   | { status: 'resolving'; id: string }
   | { status: 'loading'; root: ResolvedRoot; progress: BuildProgress }
-  | { status: 'ready'; root: ResolvedRoot; graph: GraphData }
+  | { status: 'ready'; root: ResolvedRoot; graph: GraphData; revalidating: boolean }
   | { status: 'error'; message: string };
 
 interface Props {
@@ -65,10 +65,25 @@ export default function SidePanel(props: Props): ReactElement {
             <div className="text-sm font-medium text-notion-text truncate">
               {state.status === 'ready' ? state.root.title || '(未命名)' : 'NotionGraph'}
             </div>
-            <div className="text-[11px] text-notion-muted truncate">
-              {state.status === 'ready'
-                ? `${state.graph.nodes.length} 节点 · ${state.graph.edges.length} 连接 · ${state.graph.buildTimeMs}ms`
-                : '关系图谱'}
+            <div className="text-[11px] text-notion-muted truncate flex items-center gap-1.5">
+              {state.status === 'ready' ? (
+                <>
+                  <span>
+                    {state.graph.nodes.length} 节点 · {state.graph.edges.length} 连接 · {state.graph.buildTimeMs}ms
+                  </span>
+                  {state.revalidating && (
+                    <span
+                      className="inline-flex items-center gap-1 text-notion-accent"
+                      title="正在基于历史快照做增量同步"
+                    >
+                      <span className="inline-block w-2 h-2 rounded-full bg-notion-accent animate-pulse" />
+                      同步中
+                    </span>
+                  )}
+                </>
+              ) : (
+                '关系图谱'
+              )}
             </div>
           </div>
         </div>

@@ -24,7 +24,8 @@ type LoadState =
   | { status: 'no-root' }
   | { status: 'resolving'; id: string }
   | { status: 'loading'; root: ResolvedRoot; progress: BuildProgress }
-  | { status: 'ready'; root: ResolvedRoot; graph: GraphData }
+  /** `revalidating` 为真：表示已展示的是历史快照，后台正在做增量刷新 */
+  | { status: 'ready'; root: ResolvedRoot; graph: GraphData; revalidating: boolean }
   | { status: 'error'; message: string };
 
 export default function App(): ReactElement {
@@ -67,14 +68,34 @@ export default function App(): ReactElement {
             ? { status: 'loading', root: prev.root, progress: msg.progress }
             : prev,
         );
-      } else if (msg.type === 'done') {
+      } else if (msg.type === 'snapshot') {
+        // 快照命中：立即切到 ready，展示旧图谱；同时打上 revalidating 标记
+        setState((prev) => {
+          const root: ResolvedRoot =
+            prev.status === 'loading' || prev.status === 'resolving' || prev.status === 'ready'
+              ? ('root' in prev ? prev.root : { id: msg.graph.rootId, type: 'page', title: '', url: '' })
+              : { id: msg.graph.rootId, type: 'page', title: '', url: '' };
+          return { status: 'ready', root, graph: msg.graph, revalidating: true };
+        });
+      } else if (msg.type === 'revalidating') {
+        // 冗余信号：仅用于保证 UI 上的"同步中"角标出现（即便 snapshot 消息因某种原因未触达）
         setState((prev) =>
-          prev.status === 'loading'
-            ? { status: 'ready', root: prev.root, graph: msg.graph }
-            : { status: 'ready', root: { id: msg.graph.rootId, type: 'page', title: '', url: '' }, graph: msg.graph },
+          prev.status === 'ready' ? { ...prev, revalidating: true } : prev,
         );
+      } else if (msg.type === 'done') {
+        setState((prev) => {
+          const root: ResolvedRoot =
+            prev.status === 'loading' || prev.status === 'ready'
+              ? prev.root
+              : { id: msg.graph.rootId, type: 'page', title: '', url: '' };
+          return { status: 'ready', root, graph: msg.graph, revalidating: false };
+        });
       } else if (msg.type === 'error') {
-        setState({ status: 'error', message: msg.message });
+        // 后台增量刷新失败时：若已展示快照则保留，仅清除 revalidating 状态
+        setState((prev) => {
+          if (prev.status === 'ready') return { ...prev, revalidating: false };
+          return { status: 'error', message: msg.message };
+        });
       }
     });
     port.onDisconnect.addListener(() => {
