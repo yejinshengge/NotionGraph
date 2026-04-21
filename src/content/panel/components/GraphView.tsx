@@ -38,10 +38,11 @@ export default function GraphView(props: Props): ReactElement {
   // 初始化 cytoscape
   useEffect(() => {
     ensureLayout();
-    if (!containerRef.current) return;
+    const container = containerRef.current;
+    if (!container) return;
 
     const cy = cytoscape({
-      container: containerRef.current,
+      container,
       elements,
       style: STYLE,
       wheelSensitivity: 0.25,
@@ -50,7 +51,10 @@ export default function GraphView(props: Props): ReactElement {
     });
     cyRef.current = cy;
 
-    cy.layout(LAYOUT_OPTIONS).run();
+    // 容器刚挂载时可能还没有非零尺寸（尤其是 Shadow DOM + flex 的组合），
+    // 若此时跑 fcose，viewport 近似 0，随机散列会坍缩到一条线。
+    // 这里等容器拥有实际尺寸、且布局帧稳定后再启动。
+    runLayoutWhenReady(cy, container, LAYOUT_OPTIONS);
 
     // 事件绑定
     cy.on('tap', 'node', (evt) => {
@@ -84,12 +88,13 @@ export default function GraphView(props: Props): ReactElement {
   // graph 变更：增量更新
   useEffect(() => {
     const cy = cyRef.current;
-    if (!cy) return;
+    const container = containerRef.current;
+    if (!cy || !container) return;
     cy.batch(() => {
       cy.elements().remove();
       cy.add(elements);
     });
-    cy.layout(LAYOUT_OPTIONS).run();
+    runLayoutWhenReady(cy, container, LAYOUT_OPTIONS);
   }, [elements]);
 
   // 搜索过滤：不重算布局，仅改样式
@@ -177,18 +182,78 @@ function clearHighlight(cy: Core): void {
   });
 }
 
-const LAYOUT_OPTIONS: cytoscape.LayoutOptions = {
+/**
+ * fcose 力导向布局参数。
+ *
+ * 关键取舍：
+ *   - `randomize: true`：强制随机初始化，避免稀疏树被压成一条直线；
+ *   - `quality: 'proof'`：多跑几轮迭代，对树/链状结构尤其有必要，否则容易卡在局部极值；
+ *   - `nodeRepulsion` 拉大 + `gravity` 轻度收拢：兼顾展开与不飘散；
+ *   - `packComponents: true`：把多个连通分量平面化拼接，避免再次串成一串；
+ *   - `tilingPaddingVertical/Horizontal`：给孤立/小团块留出空间，视觉上更接近 Obsidian 图谱。
+ */
+const LAYOUT_OPTIONS = {
   name: 'fcose',
+  quality: 'proof',
   animate: true,
-  animationDuration: 400,
-  randomize: false,
-  nodeRepulsion: () => 6500,
-  idealEdgeLength: () => 90,
-  edgeElasticity: () => 0.35,
-  nodeSeparation: 60,
-  padding: 24,
+  animationDuration: 500,
+  animationEasing: 'ease-out',
+  randomize: true,
+  uniformNodeDimensions: false,
+  packComponents: true,
+  nodeRepulsion: () => 12000,
+  idealEdgeLength: () => 120,
+  edgeElasticity: () => 0.2,
+  gravity: 0.25,
+  gravityRangeCompound: 1.5,
+  gravityCompound: 1.0,
+  gravityRange: 3.8,
+  nodeSeparation: 80,
+  numIter: 2500,
+  tile: true,
+  tilingPaddingVertical: 20,
+  tilingPaddingHorizontal: 20,
+  padding: 30,
   fit: true,
-} as cytoscape.LayoutOptions;
+} as unknown as cytoscape.LayoutOptions;
+
+/**
+ * 等到容器具有非零尺寸之后再跑布局，避免 fcose 在 0×0 viewport 下坍缩为一条线。
+ * 使用 ResizeObserver + 一次 rAF，保证 Shadow DOM 内 flex 子项完成真实布局。
+ */
+function runLayoutWhenReady(
+  cy: Core,
+  container: HTMLElement,
+  options: cytoscape.LayoutOptions,
+): void {
+  const start = () => {
+    cy.resize();
+    cy.layout(options).run();
+  };
+
+  const rect = container.getBoundingClientRect();
+  if (rect.width > 2 && rect.height > 2) {
+    requestAnimationFrame(start);
+    return;
+  }
+
+  const ro = new ResizeObserver((entries) => {
+    for (const entry of entries) {
+      const { width, height } = entry.contentRect;
+      if (width > 2 && height > 2) {
+        ro.disconnect();
+        requestAnimationFrame(start);
+        return;
+      }
+    }
+  });
+  ro.observe(container);
+  // 兜底：最多等 1s 后强制启动一次，防止 ResizeObserver 因极端场景不触发
+  setTimeout(() => {
+    ro.disconnect();
+    start();
+  }, 1000);
+}
 
 const STYLE: cytoscape.StylesheetJson = [
   {
