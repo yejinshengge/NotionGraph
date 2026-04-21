@@ -2,10 +2,15 @@
  * Cytoscape 封装：力导向布局 + 节点/边样式区分 + 单击高亮 + 双击跳转 + 右键换根。
  *
  * 性能策略（针对 200+ 节点的大图）：
- *   - 布局一次性收敛即停（cola `infinite:false` + `maxSimulationTime`），
- *       静止时 CPU 占用归零；拖拽节点不触发 relayout，拖到哪就放在哪；
- *   - 开启 Cytoscape 的 viewport 级隐藏：平移/缩放时不画边和 label，使用纹理缓存；
- *   - 边默认使用 `haystack`（最快的曲线类型），仅在 focused 时切回 `straight` 以保证高亮清晰；
+ *   - 初始布局一次性收敛即停（cola `infinite:false` + `maxSimulationTime`），
+ *       静止时 CPU 占用归零；
+ *   - 拖拽节点时启动 infinite cola（保留坐标、不 fit），邻居按弹簧力联动；
+ *       松手后切换为 finite cola（有 maxSimulationTime）让力场自然衰减到平衡再停，
+ *       不是硬 stop —— Obsidian 风格的弹性手感 + 低稳态功耗 + 平滑缓动；
+ *   - 平移/缩放时隐藏 label 并用纹理缓存，但**不**隐藏边，以免和拖拽时 cola 持续
+ *       更新节点位置冲突导致连线"闪没"；
+ *   - 边统一使用 `straight`（不用 haystack）：haystack 虽快，但 focused 时若切换到
+ *       straight 会导致端点渲染位置跳变，视觉上像是节点突然移动了；
  *   - 节点 label 通过 `min-zoomed-font-size` 在 zoom-out 时自动隐藏，减少文本绘制；
  *   - 搜索 query 使用 useDeferredValue 降优先级，避免键入时频繁 O(N) 遍历节点；
  *   - graph 变化时 batch 更新元素而不是整个重建；
@@ -64,8 +69,11 @@ export default function GraphView(props: Props): ReactElement {
       minZoom: 0.1,
       maxZoom: 4,
       // ---- 大图渲染优化 ----
-      // 平移/缩放中隐藏边和 label，只画节点，显著降低交互期间的绘制开销
-      hideEdgesOnViewport: true,
+      // 平移/缩放中隐藏 label，显著降低交互期间的绘制开销。
+      // 注意：不启用 hideEdgesOnViewport —— cola 持续更新节点位置时，
+      // cytoscape 会把每帧视为"viewport 变化"从而隐藏所有边，
+      // 表现为"拖拽时连线全部消失"，体验极差。
+      hideEdgesOnViewport: false,
       hideLabelsOnViewport: true,
       // 静止时把画面缓存为纹理，再次平移/缩放直接贴图
       textureOnViewport: true,
@@ -105,15 +113,34 @@ export default function GraphView(props: Props): ReactElement {
       }
     });
 
-    // 拖拽节点：仅加样式，不重启布局。
-    // 设计取舍：
-    //   - 初次收敛后布局已停止（infinite:false），此时拖拽邻居不会跟随，符合 Obsidian 风格的"定位"交互；
-    //   - 若需要"弹性"效果，可在 grabon 里启动短时 relayout，但会带来 200+ 节点下的一次抖动，权衡后选择不做。
+    // 拖拽节点：弹性联动（Obsidian 风格）。
+    // 设计：
+    //   - grab 时启动 infinite cola：被拖拽节点被 cytoscape 自动视作固定点，
+    //       邻居在弹簧/斥力下自然跟随。同时给相连边加 `drag-connected` 高亮，
+    //       让用户一眼看到当前节点连接了哪些其他节点。
+    //   - free 时不硬 stop，而是切换到 **finite cola**（有 maxSimulationTime），
+    //       让力场自然衰减到接近平衡再停 —— 这样整张图的"缓动"曲线是衰减的，
+    //       不会在最后一刻出现突兀的静止帧。
+    //   - 若用户接连拖拽多个节点，再次 grab 会 cancel 掉正在运行的 settle 布局。
     cy.on('grabon', 'node', (evt) => {
-      evt.target.addClass('grabbed');
+      const node = evt.target;
+      // 安全兜底：上一次 settle 可能还没来得及 unlock（例如 graph 重建、组件卸载等
+      // 异常路径），这里在新一次拖拽开始前统一放行所有节点，避免出现"某个节点再也拖不动"。
+      cy.nodes().unlock();
+      node.addClass('grabbed');
+      highlightConnectedEdges(cy, node.id());
+      startDragLayout(cy, layoutRef);
     });
     cy.on('free', 'node', (evt) => {
-      evt.target.removeClass('grabbed');
+      const node = evt.target;
+      node.removeClass('grabbed');
+      clearConnectedEdges(cy);
+      // 关键：锁定松手节点，避免 settle 布局把它拉回原力场平衡位置（否则"弹回原地"）；
+      // settle 结束（layoutstop）时 unlock，恢复用户拖拽能力。
+      node.lock();
+      startSettleLayout(cy, layoutRef, () => {
+        node.unlock();
+      });
     });
 
     return () => {
@@ -216,6 +243,14 @@ function classListForNode(n: GraphNode): string {
   return classes.join(' ');
 }
 
+/**
+ * 选中节点：主节点 + 邻域从背景淡出中突出。
+ *
+ * 设计取舍：
+ *   - 仅给**被选中的主节点**加粗描边（`focused-primary`），邻居只做保亮、不改尺寸；
+ *       否则邻居 border-width 从 1 跳到 3，像素尺寸变大，视觉上会被误读为"节点挪位"。
+ *   - 不切换 edge 的 curve-style（默认就是 straight），避免端点渲染位置跳变。
+ */
 function highlightNeighborhood(cy: Core, id: string): void {
   const target = cy.getElementById(id);
   if (target.empty()) return;
@@ -223,13 +258,94 @@ function highlightNeighborhood(cy: Core, id: string): void {
   cy.batch(() => {
     cy.elements().addClass('faded');
     neighborhood.removeClass('faded').addClass('focused');
+    target.addClass('focused-primary');
   });
 }
 
 function clearHighlight(cy: Core): void {
   cy.batch(() => {
-    cy.elements().removeClass('faded focused');
+    cy.elements().removeClass('faded focused focused-primary');
   });
+}
+
+/** 拖拽期间：高亮与被拖拽节点相连的边（独立 class，不影响选中高亮） */
+function highlightConnectedEdges(cy: Core, id: string): void {
+  const node = cy.getElementById(id);
+  if (node.empty()) return;
+  cy.batch(() => {
+    node.connectedEdges().addClass('drag-connected');
+  });
+}
+
+function clearConnectedEdges(cy: Core): void {
+  cy.batch(() => {
+    cy.edges().removeClass('drag-connected');
+  });
+}
+
+/**
+ * 拖拽期间使用的 cola 布局：
+ *   - `randomize: false`：保留现有节点坐标，仅施加力；否则会把整张图重随机散布。
+ *   - `infinite: true`：持续模拟，直到 free 后切换成 settle 布局。
+ *   - `fit: false`：不重置 viewport（用户当前的缩放/平移保持不变）。
+ *
+ * cytoscape 把被 `grab` 的节点视为"固定点"（grabbed 属性为 true），cola 在每一步
+ * 计算时不会改变它的位置，周围节点通过弹簧/斥力被自然带动——这就是 Obsidian 风格的
+ * 弹性拖拽手感。
+ */
+function startDragLayout(cy: Core, layoutRef: { current: cytoscape.Layouts | null }): void {
+  if (layoutRef.current) {
+    layoutRef.current.stop();
+  }
+  const dragOptions = {
+    ...(LAYOUT_OPTIONS as unknown as Record<string, unknown>),
+    randomize: false,
+    infinite: true,
+    fit: false,
+    animate: true,
+    maxSimulationTime: Number.POSITIVE_INFINITY,
+  } as unknown as cytoscape.LayoutOptions;
+  const layout = cy.layout(dragOptions);
+  layout.run();
+  layoutRef.current = layout;
+}
+
+/**
+ * 松手后的 "settle"（缓动收敛）布局：
+ *   - 从 infinite 切回 finite，`maxSimulationTime: 1800` 让 cola 在一个略长的时间窗口内
+ *       自然衰减到力学平衡；由于弹簧已经接近稳定，最后几帧的位移本来就很小，
+ *       看起来是平滑渐停而不是"突然定住"。
+ *   - 保留 `animate/refresh` 和默认的 `convergenceThreshold`，让 cola 若早已稳定可提前结束。
+ *   - 不 randomize、不 fit，保持用户视角不变。
+ *
+ * @param onStop  当 settle 布局停止（自然到期或被后续 grab 打断）时回调一次。
+ *                通常用于 unlock 之前被 free 锁定的节点。
+ */
+function startSettleLayout(
+  cy: Core,
+  layoutRef: { current: cytoscape.Layouts | null },
+  onStop?: () => void
+): void {
+  if (layoutRef.current) {
+    layoutRef.current.stop();
+  }
+  const settleOptions = {
+    ...(LAYOUT_OPTIONS as unknown as Record<string, unknown>),
+    randomize: false,
+    infinite: false,
+    fit: false,
+    animate: true,
+    // 缓动时长：足够长以掩盖 stop 边界，但也不会让 CPU 空转太久
+    maxSimulationTime: 1800,
+  } as unknown as cytoscape.LayoutOptions;
+  const layout = cy.layout(settleOptions);
+  if (onStop) {
+    // `one` 保证无论是自然到期、convergenceThreshold 提前结束，还是被后续 grab
+    // 主动 stop，都只会回调一次，避免重复 unlock。
+    layout.one('layoutstop', onStop);
+  }
+  layout.run();
+  layoutRef.current = layout;
 }
 
 /**
@@ -347,10 +463,9 @@ const STYLE: any = [
     selector: 'edge',
     style: {
       width: 1.5,
-      // haystack 是 cytoscape 里最快的曲线类型：用预绘制的线束批量渲染，
-      // 不支持箭头和弯曲，但本项目本来就是无箭头直线，完美契合。
-      'curve-style': 'haystack',
-      'haystack-radius': 0,
+      // 统一用 straight：在 200~1000 条边规模下性能足够，且避免 focused 时切换
+      // curve-style 导致的端点渲染跳变（haystack → straight 视觉上会像节点挪位）。
+      'curve-style': 'straight',
       'line-color': '#555555',
       opacity: 0.6,
     },
@@ -367,17 +482,20 @@ const STYLE: any = [
     selector: '.faded',
     style: { opacity: 0.1 },
   },
+  // 选中节点的邻域：仅保亮 + label 增强可读性，不改变节点尺寸/描边，
+  // 避免视觉上被误读为"节点位置发生变化"
   {
     selector: '.focused',
-    style: { 
+    style: {
       opacity: 1,
       'text-outline-width': 3,
       'text-outline-color': '#000000',
       'z-index': 9999,
     },
   },
+  // 只给被选中的主节点加粗描边，邻居保持原始尺寸
   {
-    selector: 'node.focused',
+    selector: 'node.focused-primary',
     style: {
       'border-width': 3,
       'border-color': '#ffffff',
@@ -386,13 +504,10 @@ const STYLE: any = [
   {
     selector: 'edge.focused',
     style: {
-      // focused 时切回 straight，保证高亮边的走线更清晰；
-      // 此时只有少量边进入该分支，不影响整体性能。
-      'curve-style': 'straight',
       width: 2.5,
       'line-color': '#aaaaaa',
       opacity: 1,
-    }
+    },
   },
   {
     selector: 'node.dimmed',
@@ -403,6 +518,16 @@ const STYLE: any = [
     style: {
       'border-width': 4,
       'border-color': '#ffffff',
-    }
-  }
+    },
+  },
+  // 拖拽期间与被拖拽节点相连的边：持续亮显，便于看清拓扑关系
+  {
+    selector: 'edge.drag-connected',
+    style: {
+      width: 2.5,
+      'line-color': '#ffd700',
+      opacity: 1,
+      'z-index': 9998,
+    },
+  },
 ];
