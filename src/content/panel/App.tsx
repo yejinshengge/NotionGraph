@@ -176,9 +176,9 @@ export default function App(): ReactElement {
           onClose={() => setOpen(false)}
           onReload={() => loadGraph({ bypassCache: true })}
           onOpenOptions={() => {
-            void chrome.runtime.sendMessage({ type: 'open-options' }).catch(() => {});
-            // 兜底：直接调用
-            chrome.runtime.openOptionsPage?.();
+            // content script 里 `chrome.runtime.openOptionsPage` 不可用，
+            // 必须走消息让 background 代为打开 Options 页
+            void sendRequest({ type: 'open-options' }).catch(() => {});
           }}
           onChangeRoot={(id) => {
             setCurrentId(id);

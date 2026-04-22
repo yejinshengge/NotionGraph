@@ -81,6 +81,13 @@ async function dispatchRequest(req: Request): Promise<Response> {
         return { cleared: true };
       });
 
+    case 'open-options':
+      // content script 无法直接调用 openOptionsPage，统一由 background 代打开
+      return handleRequest(async () => {
+        await chrome.runtime.openOptionsPage();
+        return { opened: true };
+      });
+
     default:
       return { type: 'error', message: `未知请求类型` };
   }

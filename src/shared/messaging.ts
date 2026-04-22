@@ -21,7 +21,15 @@ export type Request =
   | { type: 'settings/save'; patch: Partial<UserSettings> }
   | { type: 'notion/test-token'; token: string }
   | { type: 'notion/resolve-root'; id: string } /** 根据 id 推断是 page 还是 database 并取 meta */
-  | { type: 'cache/clear' };
+  | { type: 'cache/clear' }
+  /**
+   * 由 content script 触发的"打开 Options 页"请求。
+   *
+   * 背景：`chrome.runtime.openOptionsPage` 在 content script 里是 `undefined`
+   * （MV3 下仅扩展页面 / background 可用），直接调用会悄无声息失败；必须通过
+   * 消息转交给 background 代为调用。
+   */
+  | { type: 'open-options' };
 
 export type Response =
   | { type: 'ok'; data: unknown }
