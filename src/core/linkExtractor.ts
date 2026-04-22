@@ -35,7 +35,7 @@ interface RichTextItem {
 }
 
 /** 带 rich_text 字段的块类型集合 */
-const RICH_TEXT_BLOCK_TYPES = new Set([
+export const RICH_TEXT_BLOCK_TYPES = new Set([
   'paragraph',
   'heading_1',
   'heading_2',
@@ -106,6 +106,54 @@ export function extractRefs(
     }
   }
 
+  return out;
+}
+
+/**
+ * 将一个 Notion block 瘦身成「仅保留 extractRefs + BFS 下钻所需字段」的最小对象。
+ *
+ * 典型一个 paragraph block 的 Notion API 原始响应包含 `annotations`、`created_by`、
+ * `parent`、富文本里的 `href`、样式等近 20 个字段，序列化后可达 1~2 KB；
+ * 对于大型页面（数百个块）缓存很容易突破 `chrome.storage.local` 的配额上限。
+ *
+ * 这里做一次精确瘦身：
+ *   - 永远保留：object / id / type / has_children
+ *     （前两项为自识别必备，has_children 决定 BFS 是否继续下钻，type 决定 extractRefs 分支）
+ *   - `link_to_page` 块：保留整个 `link_to_page` 子字段
+ *   - 富文本块：保留 `[type].rich_text`，并对每个 item 只留 type/mention/text.link
+ *     （因为 extractRefs 只关心 mention 与超链接 URL）
+ *
+ * 瘦身后体积通常只有原始的 1/5 ~ 1/10，对功能无任何影响。
+ */
+export function slimBlockForRefs(b: NotionBlock): NotionBlock {
+  const slim: NotionBlock = {
+    object: b.object,
+    id: b.id,
+    type: b.type,
+    has_children: b.has_children,
+  };
+
+  if (b.type === 'link_to_page') {
+    slim.link_to_page = b.link_to_page;
+    return slim;
+  }
+
+  if (RICH_TEXT_BLOCK_TYPES.has(b.type)) {
+    const payload = b[b.type] as { rich_text?: RichTextItem[] } | undefined;
+    const items = payload?.rich_text ?? [];
+    slim[b.type] = {
+      rich_text: items.map(slimRichTextItem),
+    };
+  }
+
+  return slim;
+}
+
+/** 富文本条目瘦身：只留 type / mention / text.link（去掉 annotations/plain_text/href 等） */
+function slimRichTextItem(rt: RichTextItem): RichTextItem {
+  const out: RichTextItem = { type: rt.type };
+  if (rt.mention) out.mention = rt.mention;
+  if (rt.text?.link) out.text = { link: rt.text.link };
   return out;
 }
 

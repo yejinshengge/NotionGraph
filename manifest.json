@@ -3,7 +3,7 @@
   "name": "NotionGraph",
   "version": "0.1.0",
   "description": "在 Notion 页面右侧显示类 Obsidian 的关系图谱，可视化页面间的双向链接。",
-  "permissions": ["storage", "activeTab", "scripting", "tabs"],
+  "permissions": ["storage", "unlimitedStorage", "activeTab", "scripting", "tabs"],
   "host_permissions": [
     "https://www.notion.so/*",
     "https://*.notion.site/*",

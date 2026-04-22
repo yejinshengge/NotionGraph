@@ -11,11 +11,17 @@
   color: #d4d4d4;
 }
 
-/* Cytoscape 容器需要显式尺寸 */
+/* 图谱画布容器：背景色必须与文字描边色一致（设计方案 §2.3） */
 .ng-graph-canvas {
   width: 100%;
   height: 100%;
-  background: #1e1e1e; /* Obsidian dark mode style */
+  background: #1e1e1e;
+  /* 禁用触控板双指下拉触发的滚动 / 浏览器后退手势，避免与 wheel 缩放冲突 */
+  touch-action: none;
+  overscroll-behavior: contain;
+  /* 让 Canvas 占满容器、block 布局消除 baseline 空隙 */
+  line-height: 0;
+  user-select: none;
 }
 
 /* 右侧面板动画 */

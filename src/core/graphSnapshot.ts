@@ -72,7 +72,16 @@ export async function loadSnapshot(
   return snap;
 }
 
-/** 写入/覆盖快照 */
+/**
+ * 写入/覆盖快照。
+ *
+ * 容错策略：
+ *   - 遇到 `chrome.storage.local` 配额错误（大图 + 多 rootId 累积常见）时，
+ *     先尝试清理所有**其他** snapshot（保留当前 key）释放空间，再重试一次；
+ *   - 仍失败则仅 `console.warn`，**不向上抛出** —— 快照只是秒开优化，
+ *     即便写失败，当前这次构图的结果依然要交付给前端（否则用户会看到
+ *     "加载失败"但实际上图谱已经构建完毕）。
+ */
 export async function saveSnapshot(input: SnapshotKeyInput, graph: GraphData): Promise<void> {
   const key = buildKey(input);
   const snap: StoredSnapshot = {
@@ -80,7 +89,29 @@ export async function saveSnapshot(input: SnapshotKeyInput, graph: GraphData): P
     savedAt: Date.now(),
     version: SNAPSHOT_VERSION,
   };
-  await chrome.storage.local.set({ [key]: snap });
+  try {
+    await chrome.storage.local.set({ [key]: snap });
+    return;
+  } catch (e) {
+    console.warn('[notion-graph] saveSnapshot failed, attempting eviction and retry:', e);
+  }
+
+  // 首次写失败：清理其他 snapshot（保留当前 key），再重试一次
+  try {
+    await evictOtherSnapshots(key);
+    await chrome.storage.local.set({ [key]: snap });
+  } catch (e2) {
+    console.warn('[notion-graph] saveSnapshot retry still failing, skipping persistence:', e2);
+  }
+}
+
+/** 除给定 key 外，清理所有 snapshot.* 条目；尽力释放空间 */
+async function evictOtherSnapshots(keepKey: string): Promise<void> {
+  const all = await chrome.storage.local.get(null);
+  const toRemove = Object.keys(all).filter(
+    (k) => k.startsWith(SNAPSHOT_STORE_PREFIX) && k !== keepKey,
+  );
+  if (toRemove.length) await chrome.storage.local.remove(toRemove);
 }
 
 /** 清空全部快照（与 cacheClearAll 配合使用） */

@@ -12,6 +12,7 @@
 import pLimit from 'p-limit';
 import { cacheGet, cacheSet } from '@/shared/cache';
 import { toUuid } from './idUtils';
+import { slimBlockForRefs } from './linkExtractor';
 
 const API_BASE = 'https://api.notion.com/v1';
 const NOTION_VERSION = '2022-06-28';
@@ -111,7 +112,13 @@ export class NotionClient {
     return this.cachedGet(`db:${id}`, () => this.rawFetch(`/databases/${toUuid(id)}`));
   }
 
-  /** 获取 block 的所有子块（自动翻页直到 has_more = false） */
+  /**
+   * 获取 block 的所有子块（自动翻页直到 has_more = false）。
+   *
+   * 性能/存储优化：返回前统一用 `slimBlockForRefs` 把每个 block 瘦身到
+   * 下游（extractRefs + 递归下钻）真正需要的字段，典型体积下降 5~10 倍；
+   * 这对大型页面能显著减轻 `chrome.storage.local` 的配额压力。
+   */
   async listAllBlockChildren(id: string): Promise<NotionBlock[]> {
     const cacheKey = `blocks:${id}`;
     const cached = await cacheGet<NotionBlock[]>(cacheKey);
@@ -122,7 +129,7 @@ export class NotionClient {
     while (true) {
       const qs = cursor ? `?start_cursor=${encodeURIComponent(cursor)}&page_size=100` : '?page_size=100';
       const page = (await this.rawFetch(`/blocks/${toUuid(id)}/children${qs}`)) as unknown as ListResult<NotionBlock>;
-      all.push(...page.results);
+      for (const b of page.results) all.push(slimBlockForRefs(b));
       if (!page.has_more) break;
       cursor = page.next_cursor;
       if (!cursor) break;
@@ -167,7 +174,7 @@ export class NotionClient {
       await cacheSet(key, v, this.cacheTtlMs);
       return v;
     } catch (e) {
-      if (e instanceof NotionClientError && (e.status === 403 || e.status === 404)) {
+      if (e instanceof NotionClientError && isRecoverableResourceError(e)) {
         return null;
       }
       throw e;
@@ -188,10 +195,18 @@ export class NotionClient {
 
     const promise = limit(() => this.doFetchWithRetry(pathWithQuery, init));
     inFlight.set(key, promise);
-    // 无论成功失败都要清掉 in-flight 记录，否则后续请求拿到旧的失败 Promise
-    promise.finally(() => {
+    // 无论成功失败都要清掉 in-flight 记录，否则后续请求拿到旧的失败 Promise。
+    //
+    // 注意：这里**必须同时注册 fulfilled & rejected handler**（即 `.then(cb, cb)`）
+    // 而不是 `.finally(cb)`。`.finally` 返回的新 Promise 在原 promise reject 时
+    // 会把同一个 rejection 继续透传，若没人 .catch 就会产生 Unhandled Promise
+    // Rejection —— 即使调用方已经对 `promise` 自身 await + try/catch 了。
+    // 用 `.then(cb, cb)` 能把原 rejection 在这条清理链上「消化」掉，
+    // 同时 return 的仍是原 promise，调用方依然能感知到错误。
+    const cleanup = (): void => {
       if (inFlight.get(key) === promise) inFlight.delete(key);
-    });
+    };
+    promise.then(cleanup, cleanup);
     return promise;
   }
 
@@ -247,6 +262,33 @@ export class NotionClient {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * 判断一个 NotionClientError 是否「本质上 = 此 endpoint 访问不到该资源」，
+ * 可以静默返回 null 让上层走类型回退（例如把 page 当 database 再试一次）。
+ *
+ * 覆盖场景：
+ *   - 403 Forbidden：Integration 没被 Share 到此页面；
+ *   - 404 Not Found：id 不存在或已被删除；
+ *   - 400 validation_error 但消息提示「类型错了 / 无可访问 data source」：
+ *       · `Provided ID ... is a database, not a page` —— 我们用 /pages 查了 database；
+ *       · `Provided ID ... is a page, not a database` —— 反向情况；
+ *       · `does not contain any data sources accessible by this API bot`
+ *         —— Notion 新版 multi-source database 特性下，
+ *            旧的 /databases/{id}/query endpoint 访问不到任何 data source。
+ *     这些都不是"代码错误"，应当与 404 同等对待：节点标记为 unauthorized。
+ */
+function isRecoverableResourceError(e: NotionClientError): boolean {
+  if (e.status === 403 || e.status === 404) return true;
+  if (e.status !== 400) return false;
+  const msg = e.message;
+  return (
+    msg.includes('is a database, not a page') ||
+    msg.includes('is a page, not a database') ||
+    msg.includes('does not contain any data sources') ||
+    msg.includes('is a data_source, not a')
+  );
 }
 
 async function safeReadText(res: Response): Promise<string> {

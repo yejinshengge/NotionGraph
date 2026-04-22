@@ -38,6 +38,8 @@ interface Props {
 
 export default function SidePanel(props: Props): ReactElement {
   const { state } = props;
+  // 注：表现层已按设计方案改为「悬停高亮」，不再向外派发点击选中事件；
+  // 但底部 NodeDetail 仍保留 selectedId 框架，留给将来可能回归的「pin 选中」功能。
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [query, setQuery] = useState('');
 
@@ -125,7 +127,7 @@ export default function SidePanel(props: Props): ReactElement {
 
       {/* 图谱区 */}
       <main className="flex-1 min-h-0 relative">
-        {renderBody(state, graph, query, selectedId, setSelectedId, props.onChangeRoot)}
+        {renderBody(state, graph, query)}
       </main>
 
       {/* 底部详情 */}
@@ -146,9 +148,6 @@ function renderBody(
   state: LoadState,
   graph: GraphData | null,
   query: string,
-  selectedId: string | null,
-  setSelectedId: (id: string | null) => void,
-  onChangeRoot: (id: string) => void,
 ): ReactElement {
   if (state.status === 'no-token') {
     return (
@@ -181,15 +180,7 @@ function renderBody(
     );
   }
   if (state.status === 'ready' && graph) {
-    return (
-      <GraphView
-        graph={graph}
-        query={query}
-        selectedId={selectedId}
-        onSelect={setSelectedId}
-        onChangeRoot={onChangeRoot}
-      />
-    );
+    return <GraphView graph={graph} query={query} />;
   }
   return <LoadingState label="等待中..." />;
 }
