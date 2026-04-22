@@ -42,6 +42,12 @@ export interface InteractionCallbacks {
     /** 搜索关键字小写（空串表示无过滤） */
     query: string;
   };
+  /**
+   * 节点被「激活」—— 目前的触发源是双击命中（设计方案 §3 的交互扩展）。
+   * interaction 层自己不知道如何处理激活（打开新 tab / 聚焦 / 路由…），
+   * 把 id 向上抛给 GraphView，由业务层决定 —— 保持表现层与业务层解耦。
+   */
+  onNodeActivate?: (id: string) => void;
 }
 
 /** 邻接表：nodeId → 一度邻居 id 集合 */
@@ -323,6 +329,23 @@ export function installInteraction(
     cb.wake();
   };
 
+  /**
+   * 双击命中节点 → 激活（当前由上层实现为打开 Notion 原页面）。
+   *
+   * 注意点：
+   *   - 浏览器会在两次 click 之后才派发 dblclick，中间会触发两次 pointerdown/up；
+   *     第一次 down 命中节点时 onPointerDown 里会进入拖拽分支设置 fx/fy —— 这没关系，
+   *     up 时会立即解除，只是短暂让 simulation 重新加热一下，不会影响双击跳转；
+   *   - 调用 preventDefault() 避免浏览器默认的「双击选中」在画布上意外触发。
+   */
+  const onDoubleClick = (e: MouseEvent): void => {
+    const w = toWorld(e.clientX, e.clientY);
+    const hit = pickNodeAt(w.x, w.y);
+    if (!hit) return;
+    e.preventDefault();
+    cb.onNodeActivate?.(hit.id);
+  };
+
   const onPointerLeave = (): void => {
     // 鼠标离开画布（未拖拽时）→ 清除悬停
     if (draggingNode || panning) return;
@@ -341,6 +364,7 @@ export function installInteraction(
   canvas.addEventListener('pointercancel', onPointerUp);
   canvas.addEventListener('pointerleave', onPointerLeave);
   canvas.addEventListener('wheel', onWheel, { passive: false });
+  canvas.addEventListener('dblclick', onDoubleClick);
   // 右键菜单禁用（避免干扰画布体验；同时对齐设计方案未提到右键行为的现状）
   const onContextMenu = (e: MouseEvent): void => e.preventDefault();
   canvas.addEventListener('contextmenu', onContextMenu);
@@ -370,6 +394,7 @@ export function installInteraction(
     canvas.removeEventListener('pointercancel', onPointerUp);
     canvas.removeEventListener('pointerleave', onPointerLeave);
     canvas.removeEventListener('wheel', onWheel);
+    canvas.removeEventListener('dblclick', onDoubleClick);
     canvas.removeEventListener('contextmenu', onContextMenu);
   };
 

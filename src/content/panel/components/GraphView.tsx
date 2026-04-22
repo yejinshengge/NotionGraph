@@ -62,6 +62,16 @@ export default function GraphView(props: Props): ReactElement {
   const lastFrameTsRef = useRef<number>(0);
   const interactionRef = useRef<ReturnType<typeof installInteraction> | null>(null);
 
+  /**
+   * 最新 graph 的 ref 快照。
+   *
+   * 作用：
+   *   interaction 的 onNodeActivate 回调只在初始化时注入一次，之后的 graph 变化
+   *   不能通过 props 闭包捕获到。用 ref 让回调始终读到最新的 graph.nodes，
+   *   避免因 React re-render 的闭包陈旧而跳错页面。
+   */
+  const graphRef = useRef<GraphData>(props.graph);
+
   // -------------------- 初始化：一次性装配 --------------------
   useEffect(() => {
     const container = containerRef.current;
@@ -150,6 +160,12 @@ export default function GraphView(props: Props): ReactElement {
         simulation: stateRef.current.simulation!,
         query: stateRef.current.query,
       }),
+      onNodeActivate: (id) => {
+        // 双击节点 → 打开对应 Notion 原页面；未授权/无效 URL 直接忽略
+        const node = graphRef.current.nodes.find((n) => n.id === id);
+        if (!node || !node.url) return;
+        window.open(node.url, '_blank', 'noopener,noreferrer');
+      },
     });
     interactionRef.current = interaction;
     interaction.reapplyState(); // 让搜索过滤的默认态先生效
@@ -177,6 +193,7 @@ export default function GraphView(props: Props): ReactElement {
 
   // -------------------- graph 变化：增量同步 --------------------
   useEffect(() => {
+    graphRef.current = props.graph; // 先同步到最新快照，供交互回调闭包读取
     const sim = stateRef.current.simulation;
     const interaction = interactionRef.current;
     if (!sim || !interaction) return;
